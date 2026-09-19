@@ -9,7 +9,9 @@ FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校�
 （初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属），或将多个带唯一名称的
 Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源、冲突按连续段报告、入口一致性校验），
 以及对组装后的整像计算**与记录分片/空洞表示无关的规范化内容指纹（SHA-256）**，
-同时返回每段摘要、总字节数、入口地址与规范化清单。
+同时返回每段摘要、总字节数、入口地址与规范化清单；还可把解析后的映像**规范化导出为
+确定性的 Intel HEX 文本**（按 `max_data_bytes` 切分数据记录、不跨 64 KiB 窗口、
+窗口切换自动补扩展线性地址记录、全量重算二补校验和、可选保留入口地址）。
 
 ## 快速启动（单条命令）
 
@@ -712,6 +714,62 @@ curl -s -X POST http://localhost:8000/api/v1/image-digest \
 时也各自相同。只改一个字节、移动安放地址或改变入口地址才会改变默认指纹；
 其中仅改变入口地址时，`include_entry=false` 的「字节/安放」指纹保持不变。
 
+### `POST /api/v1/export-hex`
+
+Intel HEX 规范化导出：复用同一解析器组装映像后，把**连续段按地址升序确定性重排为
+数据记录**并输出新的 HEX 文本。同一逻辑映像无论输入怎样切分记录、用 02 还是 04
+携带基址，导出文本完全一致（规范化不动点）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/export-hex \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:10000000214601360121470136007EFE09D2190141\n:04000005080001C12D\n:00000001FF\n",
+    "max_data_bytes": 16,
+    "include_entry": true
+  }' | jq
+```
+
+导出规则：
+
+- 数据记录（`00`）每条最多 `max_data_bytes` 字节（**1..255**，默认 16），
+  且**任何一条记录都不跨越 64 KiB 地址窗口**（记录内 16 位偏移无法寻址窗外），
+  窗口边界处强制切分；
+- 每次窗口切换（含首个窗口）都先输出一条扩展线性地址记录（`04`），
+  输出中不再出现 02 型段基址记录，文本自描述、不依赖隐式初始基址；
+- `include_entry=true`（默认）且映像有入口地址时，在数据之后输出
+  线性入口记录（`05`）；为 `false` 或无入口时省略；
+- **所有记录的校验和都按二补重新计算**，末行恒为 EOF 记录（`:00000001FF`），
+  每行一条记录、以换行结尾。
+
+响应（恒为 200）：
+
+```json
+{
+  "ok": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": 134218177,
+  "include_entry": true,
+  "max_data_bytes": 16,
+  "total_bytes": 16,
+  "segment_count": 1,
+  "record_count": 4,
+  "data_record_count": 1,
+  "linear_base_record_count": 1,
+  "hex_text": ":020000040800F2\n:10000000214601360121470136007EFE09D2190141\n:04000005080001C12D\n:00000001FF\n",
+  "diagnostics": [ ... ]
+}
+```
+
+- `hex_text`：导出的规范化 HEX 文本；`record_count` 为文本中的记录总数
+  （数据 + 扩展线性地址 + 入口 + EOF），`data_record_count` 与
+  `linear_base_record_count` 分别给出 00 型与 04 型记录数。
+- **HEX 解析失败时不生成任何文本**：`ok=false`、`hex_text` 为 `null`、
+  各计数为 0，只返回与 `/api/v1/assemble` 完全一致的逐行 `diagnostics`。
+  纯警告（空行、相同字节重写）不影响导出。
+- `max_data_bytes` 超出 1..255 时返回 422 参数错误。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -740,6 +798,7 @@ app/
   vector_table.py # Cortex-M 向量表校验（小端读取、栈顶/复位/Thumb 位与区域归属，纯逻辑）
   image_merge.py  # 多映像按绝对地址叠加合并（同值归并、冲突段报告、入口一致性，纯逻辑）
   image_digest.py # 整像内容指纹（段帧规范化编码 + 整像/每段 SHA-256 + 规范化清单，纯逻辑）
+  hex_export.py   # Intel HEX 规范化导出（确定性重排、64 KiB 窗口切分、重算校验和，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
   test_validate_layout.py       # validate-layout 接口与布局逻辑
@@ -749,6 +808,7 @@ tests/
   test_validate_vector_table.py # validate-vector-table 接口与向量表校验逻辑
   test_merge_images.py          # merge-images 接口与多映像合并逻辑
   test_image_digest.py          # image-digest 接口与内容指纹逻辑（分片/空洞不变性等）
+  test_export_hex.py            # export-hex 接口与规范化导出逻辑（窗口切分/校验和/往返不变性等）
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖
