@@ -9,7 +9,10 @@ FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校�
 （初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属），或将多个带唯一名称的
 Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源、冲突按连续段报告、入口一致性校验），
 以及对组装后的整像计算**与记录分片/空洞表示无关的规范化内容指纹（SHA-256）**，
-同时返回每段摘要、总字节数、入口地址与规范化清单。
+同时返回每段摘要、总字节数、入口地址与规范化清单；还可把组装后的映像**重新导出为
+规范化 Intel HEX 文本**（按 `max_data_bytes` 确定性切分数据记录、任何记录不跨越
+64 KiB 地址窗口、窗口切换时输出扩展线性地址记录、全部记录重算二补校验和、可选保留
+入口地址），并返回导出的 HEX 文本与记录数。
 
 ## 快速启动（单条命令）
 
@@ -712,6 +715,64 @@ curl -s -X POST http://localhost:8000/api/v1/image-digest \
 时也各自相同。只改一个字节、移动安放地址或改变入口地址才会改变默认指纹；
 其中仅改变入口地址时，`include_entry=false` 的「字节/安放」指纹保持不变。
 
+### `POST /api/v1/export-hex`
+
+Intel HEX 规范化导出：复用同一解析器组装映像后，把连续映像**确定性地重排为数据记录**
+并重新输出 HEX 文本。导出结果只取决于组装后的映像与导出参数，与输入的记录切分方式、
+空洞表示或基址记录风格（02/04）无关；对导出结果再次导出会得到逐字节相同的文本
+（不动点）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/export-hex \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:10000000214601360121470136007EFE09D2190141\n:04000005080001C12D\n:00000001FF\n",
+    "max_data_bytes": 16,
+    "include_entry": true
+  }' | jq
+```
+
+导出规则：
+
+- 数据记录（类型 00）每条最多携带 `max_data_bytes` 字节（**1..255**，默认 16），
+  按地址升序连续切分；
+- **任何数据记录都不跨越 64 KiB 地址窗口**（`地址 >> 16`）：到达窗口末尾即截断，
+  窗口切换时先输出一条扩展线性地址记录（类型 04）再继续（初始窗口 0 按 Intel HEX
+  约定无需输出，保持最小必要数量）；
+- 所有记录的**二补校验和全部重算**，输出统一为大写十六进制、以 EOF 记录结尾；
+- `include_entry=true`（默认）且映像带入口地址时，在 EOF 前附加一条线性入口记录
+  （类型 05，03 型段入口也会规范化为 05 型）；为 `false` 时入口不写入导出文本，
+  但仍在响应中回显。
+
+上例请求本身已是规范形态，响应（恒为 200）：
+
+```json
+{
+  "ok": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": 134218177,
+  "total_bytes": 16,
+  "max_data_bytes": 16,
+  "include_entry": true,
+  "exported_hex": ":020000040800F2\n:10000000214601360121470136007EFE09D2190141\n:04000005080001C12D\n:00000001FF\n",
+  "record_count": 4,
+  "data_record_count": 1,
+  "extended_address_record_count": 1,
+  "entry_record_count": 1,
+  "diagnostics": [ ... ]
+}
+```
+
+- `exported_hex`：导出的规范化 HEX 文本（含结尾换行）；`record_count` 为含 EOF 的
+  总记录数，`data_record_count`/`extended_address_record_count`/`entry_record_count`
+  分别给出数据记录、扩展线性地址记录与入口记录的数量。
+- 跨窗口示例：32 字节数据位于 `0xFFF0`、`max_data_bytes=255` 时，导出为
+  `0xFFF0` 处 16 字节 → 类型 04 切换到窗口 1 → 偏移 `0x0000` 处 16 字节 → EOF。
+- **HEX 解析失败时只返回逐行 `diagnostics`**：`ok=false`、`exported_hex` 为 `null`、
+  各记录数为 0、`total_bytes` 为 0，不生成任何文本；`max_data_bytes` 越界
+  （<1 或 >255）返回 422。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -740,6 +801,7 @@ app/
   vector_table.py # Cortex-M 向量表校验（小端读取、栈顶/复位/Thumb 位与区域归属，纯逻辑）
   image_merge.py  # 多映像按绝对地址叠加合并（同值归并、冲突段报告、入口一致性，纯逻辑）
   image_digest.py # 整像内容指纹（段帧规范化编码 + 整像/每段 SHA-256 + 规范化清单，纯逻辑）
+  hex_export.py   # Intel HEX 规范化导出（确定性记录重排、64 KiB 窗口切分、校验和重算，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
   test_validate_layout.py       # validate-layout 接口与布局逻辑
@@ -749,6 +811,7 @@ tests/
   test_validate_vector_table.py # validate-vector-table 接口与向量表校验逻辑
   test_merge_images.py          # merge-images 接口与多映像合并逻辑
   test_image_digest.py          # image-digest 接口与内容指纹逻辑（分片/空洞不变性等）
+  test_export_hex.py            # export-hex 接口与规范化导出逻辑（窗口切分、不动点等）
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖

@@ -9,6 +9,7 @@ from fastapi import Body, FastAPI
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, model_validator
 
+from .hex_export import export_intel_hex
 from .hex_parser import ParseResult, parse_intel_hex
 from .image_digest import build_image_digest
 from .image_merge import MergeSource, merge_images
@@ -39,7 +40,12 @@ app = FastAPI(
         "it reaches that target, read as a Cortex-M vector table checked "
         "against ram/executable memory regions, or fingerprinted with a "
         "canonical whole-image SHA-256 that is stable across record "
-        "splitting and gap representations."
+        "splitting and gap representations. The assembled image can also "
+        "be re-emitted as a normalized Intel HEX text: deterministic "
+        "data-record layout bounded by a configurable byte count, no "
+        "record crossing a 64 KiB address window, extended linear "
+        "address records on window switches, recomputed checksums and "
+        "optional entry-address preservation."
     ),
 )
 
@@ -810,6 +816,64 @@ class ImageDigestResponse(BaseModel):
     diagnostics: list[DiagnosticOut]
 
 
+class ExportHexRequest(BaseModel):
+    hex_text: str = Field(..., description="Intel HEX text, one record per line")
+    max_data_bytes: int = Field(
+        16,
+        ge=1,
+        le=255,
+        description="Maximum payload bytes per emitted data record (the count field is one byte)",
+    )
+    include_entry: bool = Field(
+        True,
+        description=(
+            "Whether a start linear address record (type 05) preserving the "
+            "entry address is appended before the EOF record (default true)"
+        ),
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "hex_text": (
+                        ":020000040800F2\n"
+                        ":10000000214601360121470136007EFE09D2190141\n"
+                        ":04000005080001C12D\n"
+                        ":00000001FF\n"
+                    ),
+                    "max_data_bytes": 16,
+                    "include_entry": True,
+                }
+            ]
+        }
+    }
+
+
+class ExportHexResponse(BaseModel):
+    ok: bool = Field(..., description="True when no error-level diagnostic was raised")
+    error_count: int
+    warning_count: int
+    entry_address: int | None = Field(
+        None, description="From the last 03/05 record, if present; null when parsing failed"
+    )
+    total_bytes: int = Field(..., description="Sum of segment byte counts (0 when parsing failed)")
+    max_data_bytes: int = Field(..., description="Echoes the requested data-record byte cap")
+    include_entry: bool = Field(..., description="Echoes the request")
+    exported_hex: str | None = Field(
+        None, description="Normalized Intel HEX text; null when parsing failed"
+    )
+    record_count: int = Field(
+        ..., description="Total emitted records including EOF (0 when parsing failed)"
+    )
+    data_record_count: int = Field(..., description="Emitted type 00 records")
+    extended_address_record_count: int = Field(
+        ..., description="Emitted type 04 records (one per 64 KiB window switch)"
+    )
+    entry_record_count: int = Field(..., description="Emitted type 05 records (0 or 1)")
+    diagnostics: list[DiagnosticOut]
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -1509,3 +1573,60 @@ def merge_images_route(request: MergeImagesRequest) -> dict:
             for s in result.segments
         ]
     return payload
+
+
+@app.post("/api/v1/export-hex", response_model=ExportHexResponse, tags=["export"])
+def export_hex_route(request: ExportHexRequest) -> ExportHexResponse:
+    """Re-emit an assembled firmware image as normalized Intel HEX text.
+
+    The HEX text is parsed with the shared validator and the same
+    diagnostics are returned. When parsing fails no text is produced:
+    ``exported_hex`` is null and every record count is 0. Otherwise the
+    contiguous image is re-emitted deterministically: data records
+    carry at most ``max_data_bytes`` bytes and never cross a 64 KiB
+    address window, an extended linear address record (type 04) is
+    emitted whenever the window switches, every checksum is recomputed,
+    and the entry address (if any) is preserved as a start linear
+    address record (type 05) unless ``include_entry`` is false. The
+    output depends only on the assembled image, so re-exporting an
+    exported text reproduces it byte for byte.
+    """
+    parsed = parse_intel_hex(request.hex_text)
+    diagnostics = [DiagnosticOut(**vars(d)) for d in parsed.diagnostics]
+    base_fields = dict(
+        error_count=parsed.error_count,
+        warning_count=parsed.warning_count,
+        max_data_bytes=request.max_data_bytes,
+        include_entry=request.include_entry,
+        diagnostics=diagnostics,
+    )
+    if not parsed.ok:
+        return ExportHexResponse(
+            ok=False,
+            entry_address=None,
+            total_bytes=0,
+            exported_hex=None,
+            record_count=0,
+            data_record_count=0,
+            extended_address_record_count=0,
+            entry_record_count=0,
+            **base_fields,
+        )
+
+    exported = export_intel_hex(
+        parsed.segments,
+        parsed.entry_address,
+        max_data_bytes=request.max_data_bytes,
+        include_entry=request.include_entry,
+    )
+    return ExportHexResponse(
+        ok=True,
+        entry_address=exported.entry_address,
+        total_bytes=parsed.total_bytes,
+        exported_hex=exported.hex_text,
+        record_count=exported.record_count,
+        data_record_count=exported.data_record_count,
+        extended_address_record_count=exported.extended_address_record_count,
+        entry_record_count=exported.entry_record_count,
+        **base_fields,
+    )
